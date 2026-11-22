@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""ClipPulse v2.2.0 Complete Android Project Generator."""
+"""ClipPulse v2.3.0 Complete Android Project Generator."""
+import glob
 import os
+import shutil
 import sys
 
 PKG = "app/src/main/java/com/clippulse/studio"
@@ -15,10 +17,48 @@ def w(path: str, content: str) -> None:
     print(f"Wrote: {path}")
 
 
+def bundle_ndk_libcpp_shared() -> None:
+    """Bundles libc++_shared.so for all 4 ABIs from Android NDK so ffmpeg:0.18.1 never fails linking."""
+    sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or ""
+    ndk_roots = []
+    for env_key in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK_LATEST_HOME"):
+        val = os.environ.get(env_key)
+        if val and os.path.isdir(val):
+            ndk_roots.append(val)
+    if sdk and os.path.isdir(os.path.join(sdk, "ndk")):
+        for d in sorted(glob.glob(os.path.join(sdk, "ndk", "*")), reverse=True):
+            if os.path.isdir(d):
+                ndk_roots.append(d)
+
+    abi_map = {
+        "arm64-v8a": "aarch64-linux-android",
+        "armeabi-v7a": "arm-linux-androideabi",
+        "x86_64": "x86_64-linux-android",
+        "x86": "i686-linux-android",
+    }
+    for root in ndk_roots:
+        sysroot_lib = os.path.join(root, "toolchains", "llvm", "prebuilt", "linux-x86_64", "sysroot", "usr", "lib")
+        if not os.path.isdir(sysroot_lib):
+            continue
+        copied = 0
+        for abi, triple in abi_map.items():
+            src = os.path.join(sysroot_lib, triple, "libc++_shared.so")
+            if os.path.isfile(src):
+                dst_dir = os.path.join("app", "src", "main", "jniLibs", abi)
+                os.makedirs(dst_dir, exist_ok=True)
+                shutil.copy2(src, os.path.join(dst_dir, "libc++_shared.so"))
+                copied += 1
+        if copied > 0:
+            print(f"Bundled libc++_shared.so for {copied} ABIs from {root}")
+            return
+    print("Note: NDK sysroot not found; relying on packaged native libs.")
+
+
 def write_gradle_and_manifest() -> None:
     sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
     if sdk:
         w("local.properties", "sdk.dir=" + sdk.replace("\\", "\\\\") + "\n")
+    bundle_ndk_libcpp_shared()
 
     w("gradle.properties", r'''
 org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
@@ -71,8 +111,8 @@ android {
         applicationId = "com.clippulse.studio"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "2.2.0"
+        versionCode = 7
+        versionName = "2.3.0"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86") }
     }
     buildTypes {
@@ -89,7 +129,10 @@ android {
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
     packaging {
-        jniLibs { useLegacyPackaging = true }
+        jniLibs {
+            useLegacyPackaging = true
+            pickFirsts += listOf("**/libc++_shared.so")
+        }
         resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
     }
     lint {
@@ -119,6 +162,7 @@ dependencies {
     implementation("androidx.media3:media3-datasource:1.4.1")
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
+    implementation("io.github.junkfood02.youtubedl-android:aria2c:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:common:0.18.1")
 }
 ''')
@@ -304,6 +348,7 @@ data class AiConfig(
 ) {
     fun orderedKeys(): List<String> = (listOf(primaryKey.trim()) + backupKeys.map { it.trim() }).filter { it.isNotBlank() }.distinct()
     fun canUseAi(): Boolean = !offlineNoAiMode && orderedKeys().isNotEmpty() && baseUrl.isNotBlank()
+    fun connectionFingerprint(): String = "${baseUrl.trim()}|${primaryKey.trim().take(12)}|${selectedModel.trim()}"
 }
 
 sealed class AiConnectionState {
@@ -337,6 +382,12 @@ data class HeatmapPoint(val startSec: Double, val endSec: Double, val value: Dou
 data class SuperChatEvent(val donor: String, val amountDisplay: String, val usdApprox: Double, val currency: String, val message: String, val offsetSec: Double)
 data class TranscriptCue(val startSec: Double, val endSec: Double, val text: String)
 
+data class PlayableStreamInfo(
+    val url: String,
+    val userAgent: String,
+    val headers: Map<String, String> = emptyMap()
+)
+
 data class ClipCandidate(
     val id: String, val title: String, val startSec: Double, val endSec: Double,
     val hypeScore: Int, val signals: List<SignalSource>, val isMultiSignal: Boolean,
@@ -358,6 +409,7 @@ data class VideoAnalysisResult(
     val videoTitle: String, val channelName: String, val durationSec: Double,
     val heatmap: List<HeatmapPoint>, val clips: List<ClipCandidate>,
     val hasLiveChat: Boolean, val hasTranscript: Boolean, val analysisSummary: String,
+    val instantPreviewStream: PlayableStreamInfo? = null,
     val scannedAtMillis: Long = System.currentTimeMillis()
 )
 
@@ -475,6 +527,31 @@ class AiConfigStore(context: Context) {
             .putBoolean("smart_peak", c.smartPeakOnly)
             .putBoolean("offline_mode", c.offlineNoAiMode)
             .apply()
+    }
+
+    // Persist verified API connection state across app restarts
+    fun saveVerifiedConnection(config: AiConfig, latencyMs: Long, model: String) {
+        prefs.edit()
+            .putString("conn_fp", config.connectionFingerprint())
+            .putLong("conn_latency", latencyMs)
+            .putString("conn_model", model)
+            .apply()
+    }
+
+    fun clearVerifiedConnection() {
+        prefs.edit().remove("conn_fp").remove("conn_latency").remove("conn_model").apply()
+    }
+
+    fun loadPersistedConnectionState(config: AiConfig): AiConnectionState {
+        if (!config.canUseAi()) return AiConnectionState.Idle
+        val savedFp = prefs.getString("conn_fp", null) ?: return AiConnectionState.Idle
+        return if (savedFp == config.connectionFingerprint()) {
+            val ms = prefs.getLong("conn_latency", 120L)
+            val model = prefs.getString("conn_model", config.selectedModel) ?: config.selectedModel
+            AiConnectionState.Connected(ms, model)
+        } else {
+            AiConnectionState.Idle
+        }
     }
 
     fun getCookiesFile(): File? {
@@ -882,9 +959,10 @@ object UrlNormalizer {
             .toList()
         val keyLine = lines.lastOrNull {
             it.contains("403", true) || it.contains("404", true) || it.contains("Sign in", true) ||
-                it.contains("Private", true) || it.contains("ERROR:", true) || it.contains("failed", true)
+                it.contains("Private", true) || it.contains("ERROR:", true) || it.contains("CANNOT LINK", true) ||
+                it.contains("failed", true)
         } ?: lines.lastOrNull() ?: "Operation failed"
-        return keyLine.take(220)
+        return keyLine.take(240)
     }
 }
 ''')
@@ -893,6 +971,7 @@ object UrlNormalizer {
 package com.clippulse.studio.engine
 
 import android.content.Context
+import com.yausername.aria2c.Aria2c
 import com.yausername.ffmpeg.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDL
 import java.io.File
@@ -909,6 +988,7 @@ object EngineInitializer {
                 val app = context.applicationContext
                 YoutubeDL.getInstance().init(app)
                 FFmpeg.getInstance().init(app)
+                runCatching { Aria2c.getInstance().init(app) }
                 initialized = true
             }
         }
@@ -916,11 +996,28 @@ object EngineInitializer {
 
     fun resolveFfmpegExecutable(context: Context): File {
         ensureInitialized(context).getOrThrow()
-        val unpackedBin = File(context.noBackupFilesDir, "youtubedl-android/packages/ffmpeg/usr/bin/ffmpeg")
-        if (unpackedBin.exists()) return unpackedBin
         val nativeLib = File(context.applicationInfo.nativeLibraryDir, "libffmpeg.so")
         if (nativeLib.exists()) return nativeLib
+        val unpackedBin = File(context.noBackupFilesDir, "youtubedl-android/packages/ffmpeg/usr/bin/ffmpeg")
+        if (unpackedBin.exists()) return unpackedBin
         throw IllegalStateException("FFmpeg binary not found on device.")
+    }
+
+    /**
+     * Builds full LD_LIBRARY_PATH including all unpacked packages (ffmpeg/usr/lib, python/usr/lib, aria2c/usr/lib)
+     * plus nativeLibraryDir so libavdevice.so.61 and libc++_shared.so always resolve cleanly.
+     */
+    fun buildNativeLibraryPath(context: Context): String {
+        val dirs = mutableListOf<String>()
+        val pkgsRoot = File(context.noBackupFilesDir, "youtubedl-android/packages")
+        pkgsRoot.listFiles()?.forEach { pkgDir ->
+            val usrLib = File(pkgDir, "usr/lib")
+            if (usrLib.isDirectory) dirs.add(usrLib.absolutePath)
+            val lib = File(pkgDir, "lib")
+            if (lib.isDirectory) dirs.add(lib.absolutePath)
+        }
+        dirs.add(context.applicationInfo.nativeLibraryDir)
+        return dirs.distinct().joinToString(":")
     }
 
     fun autoUpdateIfStale(context: Context) {
@@ -950,28 +1047,81 @@ package com.clippulse.studio.engine
 
 import android.content.Context
 import com.clippulse.studio.data.AiConfigStore
+import com.clippulse.studio.model.PlayableStreamInfo
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
-
-data class PlayableStreamInfo(
-    val url: String,
-    val userAgent: String,
-    val referer: String
-)
 
 object StreamPreviewResolver {
     const val DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     private val cache = ConcurrentHashMap<String, PlayableStreamInfo>()
 
-    suspend fun resolvePlayableStream(context: Context, sourceUrl: String): Result<PlayableStreamInfo> = withContext(Dispatchers.IO) {
+    /**
+     * Zero-wait extraction: picks the best playable progressive MP4 (video+audio muxed)
+     * directly from .info.json so Live Preview opens immediately without another yt-dlp call.
+     */
+    fun extractInstantPreviewFromInfoJson(infoJson: JSONObject): PlayableStreamInfo? {
+        val formats = infoJson.optJSONArray("formats")
+        if (formats != null) {
+            val candidates = mutableListOf<Pair<Int, PlayableStreamInfo>>()
+            for (i in 0 until formats.length()) {
+                val f = formats.optJSONObject(i) ?: continue
+                val url = f.optString("url").trim()
+                if (!url.startsWith("http://") && !url.startsWith("https://")) continue
+                val vcodec = f.optString("vcodec", "none")
+                val acodec = f.optString("acodec", "none")
+                val ext = f.optString("ext", "")
+                val protocol = f.optString("protocol", "")
+                if (vcodec != "none" && acodec != "none" && ext.equals("mp4", true) && !protocol.contains("m3u8")) {
+                    val height = f.optInt("height", 360)
+                    val headers = parseHeaders(f.optJSONObject("http_headers"))
+                    val ua = headers["User-Agent"] ?: DESKTOP_UA
+                    // Prefer crisp fast-seeking 360p-720p progressive MP4 without c=ANDROID locks
+                    var score = when {
+                        height in 360..720 -> 100 + height / 10
+                        height > 720 -> 90
+                        else -> 50
+                    }
+                    if (!url.contains("c=ANDROID")) score += 40
+                    candidates.add(score to PlayableStreamInfo(url, ua, headers))
+                }
+            }
+            candidates.maxByOrNull { it.first }?.second?.let { return it }
+        }
+        val directUrl = infoJson.optString("url").trim()
+        if (directUrl.startsWith("http://") || directUrl.startsWith("https://")) {
+            val headers = parseHeaders(infoJson.optJSONObject("http_headers"))
+            return PlayableStreamInfo(directUrl, headers["User-Agent"] ?: DESKTOP_UA, headers)
+        }
+        return null
+    }
+
+    private fun parseHeaders(obj: JSONObject?): Map<String, String> {
+        val map = mutableMapOf("Referer" to "https://www.youtube.com/")
+        if (obj == null) return map
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val v = obj.optString(k)
+            if (v.isNotBlank()) map[k] = v
+        }
+        return map
+    }
+
+    fun putCache(sourceUrl: String, info: PlayableStreamInfo) {
+        val clean = UrlNormalizer.extractAndNormalize(sourceUrl)
+        if (clean.isNotBlank()) cache[clean] = info
+    }
+
+    suspend fun resolvePlayableStream(context: Context, sourceUrl: String, forceRefresh: Boolean = false): Result<PlayableStreamInfo> = withContext(Dispatchers.IO) {
         val clean = UrlNormalizer.extractAndNormalize(sourceUrl)
         if (clean.isBlank()) return@withContext Result.failure(IllegalArgumentException("Empty URL"))
-        cache[clean]?.let { return@withContext Result.success(it) }
+        if (!forceRefresh) cache[clean]?.let { return@withContext Result.success(it) }
 
-        val ffmpegBin = EngineInitializer.resolveFfmpegExecutable(context)
+        EngineInitializer.ensureInitialized(context).getOrThrow()
         val cookiesFile = AiConfigStore(context).getCookiesFile()
 
         val clientProfiles = listOf("tv_embedded,mweb", "ios,web", "default")
@@ -981,18 +1131,13 @@ object StreamPreviewResolver {
             val attempt = runCatching {
                 val req = YoutubeDLRequest(clean).apply {
                     addOption("-g")
-                    addOption("-f", "18/b[height<=720][ext=mp4]/b[ext=mp4]/b[height<=720]/b")
-                    addOption("--ffmpeg-location", ffmpegBin.absolutePath)
+                    addOption("-f", "18/22/b[height<=720][ext=mp4]/b[ext=mp4]/b")
                     addOption("--no-playlist")
                     addOption("--no-warnings")
                     addOption("--user-agent", DESKTOP_UA)
                     addOption("--referer", "https://www.youtube.com/")
-                    if (clientArg != "default") {
-                        addOption("--extractor-args", "youtube:player_client=$clientArg")
-                    }
-                    if (cookiesFile != null) {
-                        addOption("--cookies", cookiesFile.absolutePath)
-                    }
+                    if (clientArg != "default") addOption("--extractor-args", "youtube:player_client=$clientArg")
+                    if (cookiesFile != null) addOption("--cookies", cookiesFile.absolutePath)
                 }
                 val resp = YoutubeDL.getInstance().execute(req)
                 val streamUrl = resp.out.lineSequence()
@@ -1000,7 +1145,7 @@ object StreamPreviewResolver {
                     .firstOrNull { (it.startsWith("http://") || it.startsWith("https://")) && !it.contains("c=ANDROID") }
                     ?: resp.out.lineSequence().map { it.trim() }.firstOrNull { it.startsWith("http://") || it.startsWith("https://") }
                     ?: throw IllegalStateException("No playable preview stream available")
-                PlayableStreamInfo(streamUrl, DESKTOP_UA, "https://www.youtube.com/")
+                PlayableStreamInfo(streamUrl, DESKTOP_UA, mapOf("Referer" to "https://www.youtube.com/"))
             }
             if (attempt.isSuccess) {
                 val info = attempt.getOrThrow()
@@ -1052,9 +1197,7 @@ object SuperChatOverlayRenderer {
 
         paint.color = headerColor
         canvas.drawRoundRect(RectF(4f, 4f, width - 4f, 84f), 22f, 22f, paint)
-        if (hasMsg) {
-            canvas.drawRect(RectF(4f, 60f, width - 4f, 84f), paint)
-        }
+        if (hasMsg) canvas.drawRect(RectF(4f, 60f, width - 4f, 84f), paint)
 
         paint.color = Color.argb(55, 255, 255, 255)
         canvas.drawCircle(46f, 44f, 22f, paint)
@@ -1077,14 +1220,10 @@ object SuperChatOverlayRenderer {
             val line1 = cleanMsg.take(48)
             val line2 = if (cleanMsg.length > 48) cleanMsg.drop(48).take(46) + if (cleanMsg.length > 94) "..." else "" else ""
             canvas.drawText(line1, 24f, 114f, paint)
-            if (line2.isNotEmpty()) {
-                canvas.drawText(line2, 24f, 140f, paint)
-            }
+            if (line2.isNotEmpty()) canvas.drawText(line2, 24f, 140f, paint)
         }
 
-        FileOutputStream(outFile).use { out ->
-            bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
-        }
+        FileOutputStream(outFile).use { out -> bmp.compress(Bitmap.CompressFormat.PNG, 100, out) }
         bmp.recycle()
         return outFile
     }
@@ -1102,13 +1241,12 @@ import java.nio.charset.StandardCharsets
 object FfmpegRunner {
     fun run(context: Context, args: List<String>, onLine: ((String) -> Unit)? = null): Result<Unit> = runCatching {
         val bin = EngineInitializer.resolveFfmpegExecutable(context)
-        val nativeDir = context.applicationInfo.nativeLibraryDir
-        val binDir = bin.parentFile?.absolutePath ?: nativeDir
+        val fullLdPath = EngineInitializer.buildNativeLibraryPath(context)
         val cmd = ArrayList<String>(args.size + 1).apply { add(bin.absolutePath); addAll(args) }
         val pb = ProcessBuilder(cmd).apply {
             redirectErrorStream(true)
-            val ld = environment()["LD_LIBRARY_PATH"].orEmpty()
-            environment()["LD_LIBRARY_PATH"] = listOf(nativeDir, binDir, ld).filter { it.isNotBlank() }.distinct().joinToString(":")
+            val existing = environment()["LD_LIBRARY_PATH"].orEmpty()
+            environment()["LD_LIBRARY_PATH"] = if (existing.isBlank()) fullLdPath else "$fullLdPath:$existing"
         }
         val proc = pb.start()
         val tail = ArrayDeque<String>(24)
@@ -1292,7 +1430,6 @@ object SubtitleAndChatParser {
         if (activeCounts.isEmpty()) return emptyList()
         val avgWords = activeCounts.average().coerceAtLeast(8.0)
 
-        // English + Hindi (Devanagari & Hinglish) + Bengali excitement & reaction phrases
         val hypePhrases = listOf(
             "no way", "oh my god", "omg", "what the", "are you serious", "let's go", "lets go",
             "bro", "insane", "crazy", "unbelievable", "wait a minute", "hold on", "listen",
@@ -1375,37 +1512,42 @@ class VideoAnalysisEngine(private val aiClient: UniversalAiClient = UniversalAiC
             val cleanUrl = UrlNormalizer.extractAndNormalize(rawUrl)
             if (cleanUrl.isBlank()) return@withContext Result.failure(IllegalArgumentException("Enter a valid YouTube or Facebook link."))
 
-            onProgress(0.10f, "Initializing yt-dlp zero-download engine...")
-            val ffmpegBin = EngineInitializer.resolveFfmpegExecutable(context)
+            onProgress(0.10f, "Initializing zero-download engine...")
+            EngineInitializer.ensureInitialized(context).getOrThrow()
             val cookiesFile = AiConfigStore(context).getCookiesFile()
             val workDir = File(context.cacheDir, "analysis_${System.currentTimeMillis()}").apply { mkdirs() }
             try {
-                onProgress(0.24f, "Fetching metadata, heatmap & multilingual captions...")
-                fetchMetadataAndCaptions(cleanUrl, workDir, cookiesFile, ffmpegBin)
+                onProgress(0.25f, "Fetching metadata, heatmap & multilingual captions...")
+                fetchMetadataAndCaptions(cleanUrl, workDir, cookiesFile)
 
                 val infoFile = workDir.listFiles()?.firstOrNull { it.name.endsWith(".info.json") }
                     ?: return@withContext Result.failure(IllegalStateException("Could not read video metadata. Import cookies.txt or tap 'Update yt-dlp' in Settings."))
 
-                onProgress(0.42f, "Tracing Smart Valley-to-Valley heatmap boundaries...")
+                onProgress(0.45f, "Tracing Smart Valley-to-Valley heatmap & instant preview...")
                 val info = JSONObject(infoFile.readText(Charsets.UTF_8))
                 val title = info.optString("title").ifBlank { "Untitled Video" }
                 val channel = info.optString("uploader").ifBlank { info.optString("channel").ifBlank { "Creator" } }
                 val duration = info.optDouble("duration", 0.0).coerceAtLeast(1.0)
                 val wasLive = info.optBoolean("was_live", false) || info.optString("live_status") in listOf("was_live", "post_live")
 
+                // Extract instant playable preview stream URL directly from .info.json (0-second wait!)
+                val instantPreview = StreamPreviewResolver.extractInstantPreviewFromInfoJson(info)?.also {
+                    StreamPreviewResolver.putCache(cleanUrl, it)
+                }
+
                 val heatmap = parseHeatmap(info)
                 val raw = mutableListOf<ClipCandidate>()
                 if (heatmap.isNotEmpty()) raw.addAll(detectValleyToValleyHeatmapPeaks(heatmap, duration))
                 else raw.addAll(detectChaptersAndDesc(info, duration))
 
+                // Only download live_chat if the video actually was a livestream OR user explicitly chose Super Chats / Chat Hype
                 var allSc = emptyList<SuperChatEvent>()
                 var chatFile: File? = null
-                if (wasLive || mode == DetectionMode.SUPER_CHAT || mode == DetectionMode.CHAT_HYPE || mode == DetectionMode.SMART_ALL) {
-                    onProgress(0.56f, "Scanning live chat replay & Super Chats...")
+                if (wasLive || mode == DetectionMode.SUPER_CHAT || mode == DetectionMode.CHAT_HYPE) {
+                    onProgress(0.58f, "Scanning live chat replay & Super Chats...")
                     runCatching {
                         val chatReq = YoutubeDLRequest(cleanUrl).apply {
                             addOption("--skip-download"); addOption("--write-subs"); addOption("--sub-langs", "live_chat")
-                            addOption("--ffmpeg-location", ffmpegBin.absolutePath)
                             addOption("--no-playlist"); addOption("--no-warnings"); addOption("--ignore-errors")
                             addOption("--user-agent", StreamPreviewResolver.DESKTOP_UA)
                             if (cookiesFile != null) addOption("--cookies", cookiesFile.absolutePath)
@@ -1426,7 +1568,7 @@ class VideoAnalysisEngine(private val aiClient: UniversalAiClient = UniversalAiC
                     }
                 }
 
-                onProgress(0.70f, "Indexing transcript cues...")
+                onProgress(0.72f, "Indexing transcript cues...")
                 val vttFiles = workDir.listFiles()?.filter { it.name.endsWith(".vtt") }.orEmpty()
                 val preferredVtt = vttFiles.firstOrNull { it.name.contains(".hi.") || it.name.contains(".bn.") || it.name.contains(".en.") }
                     ?: vttFiles.firstOrNull()
@@ -1484,7 +1626,13 @@ class VideoAnalysisEngine(private val aiClient: UniversalAiClient = UniversalAiC
                     if (cues.isNotEmpty()) append(" • Transcript")
                     if (modeFiltered.isEmpty() && raw.isNotEmpty()) append(" (auto-fallback)")
                 }
-                val result = VideoAnalysisResult(cleanUrl, false, null, title, channel, duration, heatmap, consensus, chatFile != null, cues.isNotEmpty(), summary)
+                val result = VideoAnalysisResult(
+                    sourceUrlOrUri = cleanUrl, isLocalFile = false, localFilePath = null,
+                    videoTitle = title, channelName = channel, durationSec = duration,
+                    heatmap = heatmap, clips = consensus, hasLiveChat = chatFile != null,
+                    hasTranscript = cues.isNotEmpty(), analysisSummary = summary,
+                    instantPreviewStream = instantPreview
+                )
                 AiConfigStore(context).saveScanToHistory(result)
                 onProgress(1.0f, "Done!")
                 Result.success(result)
@@ -1494,7 +1642,7 @@ class VideoAnalysisEngine(private val aiClient: UniversalAiClient = UniversalAiC
         }
     }
 
-    private fun fetchMetadataAndCaptions(cleanUrl: String, workDir: File, cookiesFile: File?, ffmpegBin: File) {
+    private fun fetchMetadataAndCaptions(cleanUrl: String, workDir: File, cookiesFile: File?) {
         val outPath = File(workDir, "meta.%(ext)s").absolutePath
         val profiles = listOf("tv_embedded,mweb", "ios,web", "default")
         var lastErr: Throwable? = null
@@ -1504,7 +1652,6 @@ class VideoAnalysisEngine(private val aiClient: UniversalAiClient = UniversalAiC
                     addOption("--skip-download"); addOption("--write-info-json")
                     addOption("--write-auto-sub"); addOption("--write-subs")
                     addOption("--sub-langs", "hi.*,bn.*,en.*,es.*,ar.*,hi,bn,en")
-                    addOption("--ffmpeg-location", ffmpegBin.absolutePath)
                     addOption("--user-agent", StreamPreviewResolver.DESKTOP_UA)
                     addOption("--referer", "https://www.youtube.com/")
                     if (clientArg != "default") addOption("--extractor-args", "youtube:player_client=$clientArg")
@@ -1569,13 +1716,9 @@ class VideoAnalysisEngine(private val aiClient: UniversalAiClient = UniversalAiC
             val peakVal = hm[i].value
             if (peakVal >= 0.60 && peakVal >= hm[i - 1].value && peakVal >= hm[i + 1].value) {
                 var leftIdx = i - 1
-                while (leftIdx > 0 && hm[leftIdx - 1].value <= hm[leftIdx].value && (hm[i].startSec - hm[leftIdx].startSec) < 35.0) {
-                    leftIdx--
-                }
+                while (leftIdx > 0 && hm[leftIdx - 1].value <= hm[leftIdx].value && (hm[i].startSec - hm[leftIdx].startSec) < 35.0) leftIdx--
                 var rightIdx = i + 1
-                while (rightIdx < hm.lastIndex && hm[rightIdx + 1].value <= hm[rightIdx].value && (hm[rightIdx].endSec - hm[i].endSec) < 35.0) {
-                    rightIdx++
-                }
+                while (rightIdx < hm.lastIndex && hm[rightIdx + 1].value <= hm[rightIdx].value && (hm[rightIdx].endSec - hm[i].endSec) < 35.0) rightIdx++
                 val start = hm[leftIdx].startSec.coerceAtLeast(0.0)
                 val end = hm[rightIdx].endSec.coerceAtMost(dur).coerceAtLeast((start + 8.0).coerceAtMost(dur))
                 out.add(ClipCandidate(
@@ -1669,7 +1812,6 @@ class VideoAnalysisEngine(private val aiClient: UniversalAiClient = UniversalAiC
     }
 }
 ''')
-
 def write_exporter_service_and_ui() -> None:
     w(f"{PKG}/engine/ClipExporter.kt", r'''
 package com.clippulse.studio.engine
@@ -1695,6 +1837,8 @@ import java.util.Locale
 import java.util.UUID
 
 object ClipExporter {
+    const val ACTIVE_PROCESS_ID = "clippulse_active_dl"
+
     fun exportSingleClip(
         context: Context, sourceUrlOrUri: String, isLocalFile: Boolean, localFilePath: String?,
         videoTitle: String, clip: ClipCandidate, clipIndex: Int,
@@ -1702,7 +1846,7 @@ object ClipExporter {
         burnSuperChat: Boolean, loudnormEnabled: Boolean, includeTxtNotes: Boolean,
         onStepProgress: (Float, String) -> Unit
     ): Result<ExportedClipRecord> = runCatching {
-        val ffmpegBin = EngineInitializer.resolveFfmpegExecutable(context)
+        EngineInitializer.ensureInitialized(context).getOrThrow()
         val cookiesFile = AiConfigStore(context).getCookiesFile()
         val workDir = File(context.cacheDir, "export_${System.currentTimeMillis()}_$clipIndex").apply { mkdirs() }
         try {
@@ -1714,6 +1858,8 @@ object ClipExporter {
                 SuperChatOverlayRenderer.renderCardPng(clip.superChat, File(workDir, "sc_overlay.png"))
             } else null
 
+            val needsPostProcess = (exportMode == ExportMode.VERTICAL_CROP) || loudnormEnabled || (overlayPng != null)
+
             if (isLocalFile && !localFilePath.isNullOrBlank()) {
                 onStepProgress(0.35f, "Cutting local video clip...")
                 val ss = TimeFormatter.formatFfmpegDuration(clip.startSec)
@@ -1721,7 +1867,7 @@ object ClipExporter {
                 renderWithFfmpeg(context, localFilePath, outMp4.absolutePath, ss, dur, exportMode, overlayPng, loudnormEnabled)
             } else {
                 val cleanUrl = UrlNormalizer.extractAndNormalize(sourceUrlOrUri)
-                val downloadedSection = downloadSectionFast(
+                val downloadedSection = downloadSectionTurbo(
                     context = context,
                     cleanUrl = cleanUrl,
                     quality = quality,
@@ -1729,18 +1875,23 @@ object ClipExporter {
                     endSec = clip.endSec,
                     workDir = workDir,
                     cookiesFile = cookiesFile,
-                    ffmpegBin = ffmpegBin,
                     onStepProgress = onStepProgress
                 )
-                onStepProgress(0.82f, "Finalizing MP4 & applying effects...")
-                renderWithFfmpeg(context, downloadedSection.absolutePath, outMp4.absolutePath, null, null, exportMode, overlayPng, loudnormEnabled)
+                if (!needsPostProcess && downloadedSection.extension.equals("mp4", true)) {
+                    // Zero-overhead Fast Cut: already trimmed MP4, copy straight to destination!
+                    onStepProgress(0.88f, "Fast Cut complete—saving to storage...")
+                    downloadedSection.copyTo(outMp4, overwrite = true)
+                } else {
+                    onStepProgress(0.82f, "Applying crop/overlay/audio polish...")
+                    renderWithFfmpeg(context, downloadedSection.absolutePath, outMp4.absolutePath, null, null, exportMode, overlayPng, loudnormEnabled)
+                }
             }
 
             if (!outMp4.exists() || outMp4.length() == 0L) {
                 throw IllegalStateException("Rendered MP4 is empty (0 bytes).")
             }
 
-            onStepProgress(0.94f, "Saving to ${storagePreset.relativeSubdir}...")
+            onStepProgress(0.94f, "Saving to storage folder...")
             val fileSize = outMp4.length()
             val (displayPath, contentUri) = saveVideoToDestination(context, outMp4, baseName, storagePreset, customTreeUri)
             if (includeTxtNotes) {
@@ -1760,7 +1911,7 @@ object ClipExporter {
         throw IllegalStateException(UrlNormalizer.sanitizeErrorMessage(err.message ?: "Export failed"))
     }
 
-    private fun downloadSectionFast(
+    private fun downloadSectionTurbo(
         context: Context,
         cleanUrl: String,
         quality: DownloadQuality,
@@ -1768,22 +1919,25 @@ object ClipExporter {
         endSec: Double,
         workDir: File,
         cookiesFile: File?,
-        ffmpegBin: File,
         onStepProgress: (Float, String) -> Unit
     ): File {
         val sectionSpec = "*${TimeFormatter.formatSectionTimestamp(startSec)}-${TimeFormatter.formatSectionTimestamp(endSec)}"
         val profiles = listOf("tv_embedded,mweb", "ios,web", "default")
         var lastError: Throwable? = null
 
-        // Pass 1: Fast keyframe-seek section download (NO --force-keyframes-at-cuts so it never downloads from 00:00:00)
+        // Pass 1: Turbo 8-thread concurrent fragment section download
         for (clientArg in profiles) {
             val sectionOut = File(workDir, "sec_${clientArg.take(3)}.%(ext)s")
             val attempt = runCatching {
                 val req = YoutubeDLRequest(cleanUrl).apply {
                     addOption("-f", quality.formatSelector)
-                    addOption("--ffmpeg-location", ffmpegBin.absolutePath)
                     addOption("--merge-output-format", "mp4")
                     addOption("--download-sections", sectionSpec)
+                    addOption("-N", "8")
+                    addOption("--no-mtime")
+                    addOption("--no-check-certificates")
+                    addOption("--retries", "3")
+                    addOption("--fragment-retries", "3")
                     addOption("--no-playlist")
                     addOption("--no-warnings")
                     addOption("--user-agent", StreamPreviewResolver.DESKTOP_UA)
@@ -1792,11 +1946,11 @@ object ClipExporter {
                     if (cookiesFile != null) addOption("--cookies", cookiesFile.absolutePath)
                     addOption("-o", sectionOut.absolutePath)
                 }
-                YoutubeDL.getInstance().execute(req) { progress, etaSec, _ ->
+                YoutubeDL.getInstance().execute(req, ACTIVE_PROCESS_ID) { progress, etaSec, _ ->
                     val pct = progress.coerceIn(0f, 100f)
-                    val mapped = 0.08f + (pct / 100f) * 0.68f
+                    val mapped = 0.08f + (pct / 100f) * 0.70f
                     val etaTxt = if (etaSec > 0L) " (ETA ${etaSec}s)" else ""
-                    onStepProgress(mapped, "Downloading clip section: ${pct.toInt()}%$etaTxt")
+                    onStepProgress(mapped, "Turbo downloading clip: ${pct.toInt()}%$etaTxt")
                 }
             }
             val found = workDir.listFiles()?.firstOrNull {
@@ -1806,12 +1960,15 @@ object ClipExporter {
             lastError = attempt.exceptionOrNull()
         }
 
-        // Pass 2: Fallback for non-seekable servers (e.g. certain Facebook Reels) — download compact 720p file & slice locally
-        onStepProgress(0.30f, "Server blocked range seek; downloading compact stream to slice locally...")
+        // Pass 2: 16-connection Aria2c accelerated fallback for non-seekable servers
+        onStepProgress(0.28f, "Switching to 16-thread Aria2c fast downloader...")
         val fullFallbackOut = File(workDir, "full_source.%(ext)s")
         val fallbackReq = YoutubeDLRequest(cleanUrl).apply {
             addOption("-f", "b[height<=720][ext=mp4]/b[ext=mp4]/best")
-            addOption("--ffmpeg-location", ffmpegBin.absolutePath)
+            addOption("--downloader", "libaria2c.so")
+            addOption("--downloader-args", "aria2c:-x 16 -s 16 -k 1M --summary-interval=1")
+            addOption("--no-mtime")
+            addOption("--no-check-certificates")
             addOption("--no-playlist")
             addOption("--no-warnings")
             addOption("--user-agent", StreamPreviewResolver.DESKTOP_UA)
@@ -1820,9 +1977,9 @@ object ClipExporter {
             addOption("-o", fullFallbackOut.absolutePath)
         }
         val fbAttempt = runCatching {
-            YoutubeDL.getInstance().execute(fallbackReq) { progress, _, _ ->
+            YoutubeDL.getInstance().execute(fallbackReq, ACTIVE_PROCESS_ID) { progress, _, _ ->
                 val pct = progress.coerceIn(0f, 100f)
-                onStepProgress(0.30f + (pct / 100f) * 0.40f, "Downloading stream: ${pct.toInt()}%")
+                onStepProgress(0.28f + (pct / 100f) * 0.45f, "Aria2c 16x download: ${pct.toInt()}%")
             }
         }
         val fullFile = workDir.listFiles()?.firstOrNull {
@@ -1832,7 +1989,7 @@ object ClipExporter {
         val localSliced = File(workDir, "local_sliced.mp4")
         val ss = TimeFormatter.formatFfmpegDuration(startSec)
         val dur = TimeFormatter.formatFfmpegDuration((endSec - startSec).coerceAtLeast(1.0))
-        FfmpegRunner.run(context, listOf("-y", "-ss", ss, "-i", fullFile.absolutePath, "-t", dur, "-c", "copy", localSliced.absolutePath)).getOrThrow()
+        FfmpegRunner.run(context, listOf("-y", "-ss", ss, "-i", fullFile.absolutePath, "-t", dur, "-c", "copy", "-movflags", "+faststart", localSliced.absolutePath)).getOrThrow()
         fullFile.delete()
         return localSliced
     }
@@ -1855,7 +2012,6 @@ object ClipExporter {
         if (mode == ExportMode.FAST_COPY && !loudnorm && !hasOverlay) {
             val fastCopy = FfmpegRunner.run(context, baseInput + listOf("-c", "copy", "-movflags", "+faststart", outputPath))
             if (fastCopy.isSuccess) return
-            // If stream codec cannot be stream-copied into MP4, re-encode cleanly with ultrafast preset
             FfmpegRunner.run(
                 context,
                 baseInput + listOf("-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", outputPath)
@@ -1866,14 +2022,14 @@ object ClipExporter {
         val vArgs = when {
             hasOverlay && mode == ExportMode.VERTICAL_CROP -> listOf(
                 "-filter_complex", "[0:v]crop=ih*9/16:ih[bg];[1:v]scale=min(iw\\,520):-1[ov];[bg][ov]overlay=(W-w)/2:H-h-90",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "2"
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "4"
             )
             hasOverlay -> listOf(
                 "-filter_complex", "[1:v]scale=min(iw\\,560):-1[ov];[0:v][ov]overlay=28:H-h-28",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "2"
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "4"
             )
             mode == ExportMode.VERTICAL_CROP -> listOf(
-                "-vf", "crop=ih*9/16:ih", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "2"
+                "-vf", "crop=ih*9/16:ih", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "4"
             )
             else -> listOf("-c:v", "copy")
         }
@@ -1892,39 +2048,29 @@ object ClipExporter {
     ): Pair<String, Uri> {
         val fileNameWithExt = "$baseNameNoExt.mp4"
 
-        // 1. Custom SAF Folder selected by user
         if (!customTreeUri.isNullOrBlank()) {
             val treeUri = Uri.parse(customTreeUri)
             val tree = DocumentFile.fromTreeUri(context, treeUri)
-                ?: throw IllegalStateException("Custom storage folder is no longer accessible. Please re-select the folder.")
+                ?: throw IllegalStateException("Custom folder permission expired. Tap 'Change Custom Folder'.")
             if (!tree.canWrite()) {
-                throw IllegalStateException("No write permission for custom folder. Tap 'Change Custom Folder' and grant access.")
+                throw IllegalStateException("No write permission for custom folder. Tap 'Change Custom Folder'.")
             }
             tree.findFile(fileNameWithExt)?.delete()
             tree.findFile(baseNameNoExt)?.delete()
-            // Pass baseNameNoExt so Android SAF appends .mp4 cleanly without creating .mp4.mp4
             val doc = tree.createFile("video/mp4", baseNameNoExt)
-                ?: throw IllegalStateException("Failed to create file in selected custom folder.")
+                ?: throw IllegalStateException("Failed to create MP4 in custom folder.")
             var bytesWritten = 0L
             context.contentResolver.openOutputStream(doc.uri)?.use { out ->
-                FileInputStream(src).use { inp ->
-                    bytesWritten = inp.copyTo(out, 65536)
-                    out.flush()
-                }
-            } ?: throw IllegalStateException("Unable to open output stream for custom folder.")
+                FileInputStream(src).use { inp -> bytesWritten = inp.copyTo(out, 65536); out.flush() }
+            } ?: throw IllegalStateException("Unable to write to custom folder.")
             if (bytesWritten <= 0L) throw IllegalStateException("0 bytes written to custom folder.")
             val folderLabel = AiConfigStore.extractTreeFolderLabel(treeUri)
             return "$folderLabel / ${doc.name ?: fileNameWithExt}" to doc.uri
         }
 
-        // 2. Android 10+ MediaStore (Movies/ClipPulse, Download/ClipPulse, or DCIM/ClipPulse)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val r = context.contentResolver
-            val preferredCollection = if (preset == StoragePreset.DOWNLOADS) {
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI
-            } else {
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            }
+            val preferredCollection = if (preset == StoragePreset.DOWNLOADS) MediaStore.Downloads.EXTERNAL_CONTENT_URI else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, fileNameWithExt)
                 put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
@@ -1933,29 +2079,20 @@ object ClipExporter {
             }
             var targetPath = "${preset.relativeSubdir}/$fileNameWithExt"
             var itemUri = runCatching { r.insert(preferredCollection, values) }.getOrNull()
-
-            // Fallback to Movies/ClipPulse if OEM ROM rejects MediaStore.Downloads
             if (itemUri == null) {
                 values.put(MediaStore.MediaColumns.RELATIVE_PATH, StoragePreset.MOVIES.relativeSubdir)
                 targetPath = "${StoragePreset.MOVIES.relativeSubdir}/$fileNameWithExt"
                 itemUri = r.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                    ?: throw IllegalStateException("Android MediaStore could not create video file.")
+                    ?: throw IllegalStateException("MediaStore could not create video file.")
             }
-
             r.openOutputStream(itemUri)?.use { out ->
-                FileInputStream(src).use { inp ->
-                    inp.copyTo(out, 65536)
-                    out.flush()
-                }
-            } ?: throw IllegalStateException("Unable to write video to gallery storage.")
-
-            values.clear()
-            values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                FileInputStream(src).use { inp -> inp.copyTo(out, 65536); out.flush() }
+            } ?: throw IllegalStateException("Unable to write video to gallery.")
+            values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING, 0)
             r.update(itemUri, values, null, null)
             return targetPath to itemUri
         }
 
-        // 3. Android 8/9 Legacy External Storage
         val basePublicDir = when (preset) {
             StoragePreset.DOWNLOADS -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             StoragePreset.DCIM -> Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
@@ -1976,32 +2113,20 @@ object ClipExporter {
         if (!customTreeUri.isNullOrBlank()) {
             val savedCustom = runCatching {
                 val tree = DocumentFile.fromTreeUri(context, Uri.parse(customTreeUri)) ?: return@runCatching false
-                tree.findFile(txtFileName)?.delete()
-                tree.findFile(baseNameNoExt)?.delete()
+                tree.findFile(txtFileName)?.delete(); tree.findFile(baseNameNoExt)?.delete()
                 val doc = tree.createFile("text/plain", baseNameNoExt) ?: return@runCatching false
                 context.contentResolver.openOutputStream(doc.uri)?.use { it.write(content.toByteArray(StandardCharsets.UTF_8)) }
                 true
             }.getOrDefault(false)
             if (savedCustom) return
         }
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val r = context.contentResolver
-            val relPath = if (preset == StoragePreset.DOWNLOADS) {
-                StoragePreset.DOWNLOADS.relativeSubdir
-            } else {
-                "${Environment.DIRECTORY_DOCUMENTS}/ClipPulse"
-            }
-            val collection = if (preset == StoragePreset.DOWNLOADS) {
-                MediaStore.Downloads.EXTERNAL_CONTENT_URI
-            } else {
-                MediaStore.Files.getContentUri("external")
-            }
+            val relPath = if (preset == StoragePreset.DOWNLOADS) StoragePreset.DOWNLOADS.relativeSubdir else "${Environment.DIRECTORY_DOCUMENTS}/ClipPulse"
+            val collection = if (preset == StoragePreset.DOWNLOADS) MediaStore.Downloads.EXTERNAL_CONTENT_URI else MediaStore.Files.getContentUri("external")
             val v = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, txtFileName)
-                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, relPath)
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
+                put(MediaStore.MediaColumns.DISPLAY_NAME, txtFileName); put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relPath); put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
             val uri = runCatching { r.insert(collection, v) }.getOrNull() ?: return
             r.openOutputStream(uri)?.use { it.write(content.toByteArray(StandardCharsets.UTF_8)) }
@@ -2044,6 +2169,7 @@ import androidx.core.content.ContextCompat
 import com.clippulse.studio.data.AiConfigStore
 import com.clippulse.studio.engine.ClipExporter
 import com.clippulse.studio.model.*
+import com.yausername.youtubedl_android.YoutubeDL
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -2069,6 +2195,7 @@ class ClipExportService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_CANCEL) {
+            runCatching { YoutubeDL.getInstance().destroyProcessById(ClipExporter.ACTIVE_PROCESS_ID) }
             activeJob?.cancel()
             ExportProgressBus.update(ExportJobState.Failed("Export canceled by user."))
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -2106,30 +2233,16 @@ class ClipExportService : Service() {
             for ((i, c) in clips.withIndex()) {
                 if (!isActive) break
                 val clipLabel = c.viralTitle.ifBlank { c.title }
-                ExportProgressBus.update(
-                    ExportJobState.Running(i + 1, clips.size, clipLabel, "Starting download...", i.toFloat() / clips.size)
-                )
+                ExportProgressBus.update(ExportJobState.Running(i + 1, clips.size, clipLabel, "Starting Turbo download...", i.toFloat() / clips.size))
 
                 val result = ClipExporter.exportSingleClip(
-                    context = applicationContext,
-                    sourceUrlOrUri = url,
-                    isLocalFile = isLocal,
-                    localFilePath = localPath,
-                    videoTitle = title,
-                    clip = c,
-                    clipIndex = i,
-                    quality = quality,
-                    exportMode = mode,
-                    storagePreset = storagePreset,
-                    customTreeUri = customTreeUri,
-                    burnSuperChat = burnSc,
-                    loudnormEnabled = loudnorm,
-                    includeTxtNotes = txt
+                    context = applicationContext, sourceUrlOrUri = url, isLocalFile = isLocal, localFilePath = localPath,
+                    videoTitle = title, clip = c, clipIndex = i, quality = quality, exportMode = mode,
+                    storagePreset = storagePreset, customTreeUri = customTreeUri, burnSuperChat = burnSc,
+                    loudnormEnabled = loudnorm, includeTxtNotes = txt
                 ) { stepFrac, stepText ->
                     val overall = (i.toFloat() + stepFrac.coerceIn(0f, 1f)) / clips.size.toFloat()
-                    ExportProgressBus.update(
-                        ExportJobState.Running(i + 1, clips.size, clipLabel, stepText, overall)
-                    )
+                    ExportProgressBus.update(ExportJobState.Running(i + 1, clips.size, clipLabel, stepText, overall))
                     notifySafe(4102, "Clip ${i + 1}/${clips.size}: $stepText", clipLabel, (overall * 100f).toInt(), 100, true)
                 }
 
@@ -2239,9 +2352,12 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
     private val store = AiConfigStore(app)
     private val aiClient = UniversalAiClient()
     private val engine = VideoAnalysisEngine(aiClient)
+
+    private val initialConfig = store.load()
     private val _ui = MutableStateFlow(
         StudioUiState(
-            aiConfig = store.load(),
+            aiConfig = initialConfig,
+            aiConnectionState = store.loadPersistedConnectionState(initialConfig),
             downloadSettings = store.loadDownloadSettings(),
             downloadHistory = store.loadDownloadHistory(),
             scanHistory = store.loadScanHistory(),
@@ -2255,6 +2371,16 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             ExportProgressBus.historyVersion.collect {
                 _ui.update { it.copy(downloadHistory = store.loadDownloadHistory()) }
+            }
+        }
+        // Silently auto-verify saved API key on startup if user had not verified it yet
+        if (initialConfig.canUseAi() && _ui.value.aiConnectionState is AiConnectionState.Idle) {
+            viewModelScope.launch {
+                val res = aiClient.testConnection(initialConfig)
+                if (res is AiConnectionState.Connected) {
+                    store.saveVerifiedConnection(initialConfig, res.latencyMs, res.model)
+                }
+                _ui.update { it.copy(aiConnectionState = res) }
             }
         }
     }
@@ -2277,17 +2403,21 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
     fun toggleClipExpanded(id: String) {
         val opening = _ui.value.expandedClipId != id
         _ui.update { it.copy(expandedClipId = if (opening) id else null, previewError = null) }
-        if (opening) ensureLiveStreamPreviewUrl()
+        if (opening) ensureLiveStreamPreviewUrl(forceRefresh = false)
     }
 
-    private fun ensureLiveStreamPreviewUrl() {
+    fun reloadPreviewStream() {
+        ensureLiveStreamPreviewUrl(forceRefresh = true)
+    }
+
+    private fun ensureLiveStreamPreviewUrl(forceRefresh: Boolean) {
         val res = _ui.value.analysisResult ?: return
         if (res.isLocalFile) return
-        if (_ui.value.resolvedStreamInfo != null || _ui.value.isResolvingPreview) return
+        if (!forceRefresh && (_ui.value.resolvedStreamInfo != null || _ui.value.isResolvingPreview)) return
         viewModelScope.launch {
-            _ui.update { it.copy(isResolvingPreview = true, previewError = null) }
-            StreamPreviewResolver.resolvePlayableStream(getApplication(), res.sourceUrlOrUri).fold(
-                onSuccess = { info -> _ui.update { it.copy(resolvedStreamInfo = info, isResolvingPreview = false) } },
+            _ui.update { it.copy(isResolvingPreview = true, previewError = null, resolvedStreamInfo = if (forceRefresh) null else it.resolvedStreamInfo) }
+            StreamPreviewResolver.resolvePlayableStream(getApplication(), res.sourceUrlOrUri, forceRefresh).fold(
+                onSuccess = { info -> _ui.update { it.copy(resolvedStreamInfo = info, isResolvingPreview = false, previewError = null) } },
                 onFailure = { err -> _ui.update { it.copy(isResolvingPreview = false, previewError = err.message ?: "Preview unavailable") } }
             )
         }
@@ -2297,7 +2427,7 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
         val clips = _ui.value.analysisResult?.clips ?: return
         val nearest = clips.minByOrNull { abs(((it.startSec + it.endSec) / 2.0) - sec) } ?: return
         _ui.update { it.copy(focusedClipId = nearest.id, expandedClipId = nearest.id) }
-        ensureLiveStreamPreviewUrl()
+        ensureLiveStreamPreviewUrl(forceRefresh = false)
     }
 
     fun toggleClipSelected(id: String) = _ui.update { st ->
@@ -2354,7 +2484,7 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update {
             it.copy(analysisResult = updated, scanHistory = store.loadScanHistory(), expandedClipId = newClip.id, focusedClipId = newClip.id)
         }
-        ensureLiveStreamPreviewUrl()
+        ensureLiveStreamPreviewUrl(forceRefresh = false)
     }
 
     fun loadCachedScan(scan: VideoAnalysisResult) {
@@ -2364,10 +2494,12 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
                 activeTab = StudioTab.STUDIO, sourceInput = scan.sourceUrlOrUri,
                 analysisResult = scan, analysisError = null, activeSignalFilter = null,
                 expandedClipId = firstId, focusedClipId = firstId,
-                resolvedStreamInfo = null, previewError = null
+                resolvedStreamInfo = scan.instantPreviewStream, previewError = null
             )
         }
-        if (firstId != null && !scan.isLocalFile) ensureLiveStreamPreviewUrl()
+        if (firstId != null && !scan.isLocalFile && scan.instantPreviewStream == null) {
+            ensureLiveStreamPreviewUrl(forceRefresh = false)
+        }
     }
 
     fun clearScanHistory() {
@@ -2402,9 +2534,7 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun setDownloadQuality(q: DownloadQuality) = saveDl { it.copy(quality = q) }
     fun setExportMode(m: ExportMode) = saveDl { it.copy(exportMode = m) }
-    fun setStoragePreset(preset: StoragePreset) = saveDl {
-        it.copy(storagePreset = preset, customTreeUri = null, customTreeLabel = null)
-    }
+    fun setStoragePreset(preset: StoragePreset) = saveDl { it.copy(storagePreset = preset, customTreeUri = null, customTreeLabel = null) }
     fun setCustomStorageTreeUri(treeUri: Uri) {
         runCatching {
             val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -2443,11 +2573,12 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
                     _ui.update {
                         it.copy(
                             isAnalyzing = false, analysisProgress = 1f, analysisResult = res,
+                            resolvedStreamInfo = res.instantPreviewStream,
                             scanHistory = store.loadScanHistory(), activeSignalFilter = null,
                             expandedClipId = firstId, focusedClipId = firstId
                         )
                     }
-                    if (firstId != null) ensureLiveStreamPreviewUrl()
+                    if (firstId != null && res.instantPreviewStream == null) ensureLiveStreamPreviewUrl(forceRefresh = false)
                 },
                 onFailure = { err -> _ui.update { it.copy(isAnalyzing = false, analysisError = err.message ?: "Analysis failed") } }
             )
@@ -2498,7 +2629,12 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cancelActiveExport() = ClipExportService.cancelExport(getApplication())
 
-    private fun saveCfg(fn: (AiConfig) -> AiConfig) = _ui.update { st -> val u = fn(st.aiConfig); store.save(u); st.copy(aiConfig = u, modelFetchError = null) }
+    private fun saveCfg(fn: (AiConfig) -> AiConfig) = _ui.update { st ->
+        val u = fn(st.aiConfig)
+        store.save(u)
+        val persistedState = store.loadPersistedConnectionState(u)
+        st.copy(aiConfig = u, aiConnectionState = persistedState, modelFetchError = null)
+    }
     fun selectAiPreset(p: AiPreset) = saveCfg { it.copy(preset = p, baseUrl = p.defaultBaseUrl, selectedModel = p.defaultModel) }
     fun updateAiBaseUrl(u: String) = saveCfg { it.copy(baseUrl = u) }
     fun updatePrimaryApiKey(k: String) = saveCfg { it.copy(primaryKey = k) }
@@ -2528,7 +2664,13 @@ class ClipPulseViewModel(app: Application) : AndroidViewModel(app) {
         store.save(cfg)
         viewModelScope.launch {
             _ui.update { it.copy(aiConfig = cfg, aiConnectionState = AiConnectionState.Testing) }
-            _ui.update { it.copy(aiConnectionState = aiClient.testConnection(cfg)) }
+            val result = aiClient.testConnection(cfg)
+            if (result is AiConnectionState.Connected) {
+                store.saveVerifiedConnection(cfg, result.latencyMs, result.model)
+            } else {
+                store.clearVerifiedConnection()
+            }
+            _ui.update { it.copy(aiConnectionState = result) }
         }
     }
 
@@ -2618,14 +2760,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import com.clippulse.studio.data.AiConfigStore
-import com.clippulse.studio.engine.PlayableStreamInfo
 import com.clippulse.studio.engine.StreamPreviewResolver
 import com.clippulse.studio.model.*
 import com.clippulse.studio.ui.theme.*
@@ -2698,14 +2841,19 @@ fun InteractiveHeatmapTimeline(durationSec: Double, heatmap: List<HeatmapPoint>,
 @Composable
 fun LiveClipPreviewPlayer(
     mediaUri: Uri,
+    userAgent: String,
+    requestHeaders: Map<String, String>,
     startSec: Double,
     endSec: Double,
     totalDurationSec: Double,
     isOnlineStream: Boolean,
-    onRangeDragged: (Double, Double) -> Unit
+    onRangeDragged: (Double, Double) -> Unit,
+    onReloadStream: () -> Unit
 ) {
     val ctx = LocalContext.current
     var playing by remember { mutableStateOf(false) }
+    var buffering by remember { mutableStateOf(true) }
+    var playerErr by remember(mediaUri) { mutableStateOf<String?>(null) }
     var currentSec by remember { mutableStateOf(startSec) }
 
     val safeTotal = totalDurationSec.coerceAtLeast(endSec + 5.0).coerceAtLeast(10.0)
@@ -2716,12 +2864,19 @@ fun LiveClipPreviewPlayer(
     var sliderRange by remember(startSec, endSec) { mutableStateOf(initStart..initEnd) }
 
     val player = remember(mediaUri) {
+        val headers = requestHeaders.ifEmpty { mapOf("Referer" to "https://www.youtube.com/") }
         val httpFactory = DefaultHttpDataSource.Factory()
-            .setUserAgent(StreamPreviewResolver.DESKTOP_UA)
-            .setDefaultRequestProperties(mapOf("Referer" to "https://www.youtube.com/"))
+            .setUserAgent(userAgent.ifBlank { StreamPreviewResolver.DESKTOP_UA })
+            .setDefaultRequestProperties(headers)
+            .setConnectTimeoutMs(12000)
+            .setReadTimeoutMs(15000)
             .setAllowCrossProtocolRedirects(true)
         val dataSourceFactory = DefaultDataSource.Factory(ctx, httpFactory)
+        val fastLoadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(5000, 15000, 800, 1200)
+            .build()
         ExoPlayer.Builder(ctx)
+            .setLoadControl(fastLoadControl)
             .setMediaSourceFactory(DefaultMediaSourceFactory(ctx).setDataSourceFactory(dataSourceFactory))
             .build()
             .apply {
@@ -2738,7 +2893,7 @@ fun LiveClipPreviewPlayer(
 
     LaunchedEffect(player, startSec, endSec) {
         while (true) {
-            delay(220L)
+            delay(200L)
             val posSec = player.currentPosition / 1000.0
             currentSec = posSec
             if (player.isPlaying && posSec >= endSec) {
@@ -2751,6 +2906,14 @@ fun LiveClipPreviewPlayer(
     DisposableEffect(player) {
         val l = object : Player.Listener {
             override fun onIsPlayingChanged(p: Boolean) { playing = p }
+            override fun onPlaybackStateChanged(state: Int) {
+                buffering = (state == Player.STATE_BUFFERING)
+                if (state == Player.STATE_READY) playerErr = null
+            }
+            override fun onPlayerError(error: PlaybackException) {
+                buffering = false
+                playerErr = "Stream expired or blocked (${error.errorCodeName}). Tap Reload."
+            }
         }
         player.addListener(l)
         onDispose { player.removeListener(l); player.release() }
@@ -2758,10 +2921,22 @@ fun LiveClipPreviewPlayer(
 
     Surface(modifier = Modifier.fillMaxWidth(), color = ElevatedSlate, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, HairlineBorder)) {
         Column(Modifier.padding(8.dp)) {
-            AndroidView(
-                factory = { c -> PlayerView(c).apply { this.player = player; useController = false } },
-                modifier = Modifier.fillMaxWidth().height(175.dp)
-            )
+            Box(modifier = Modifier.fillMaxWidth().height(178.dp), contentAlignment = Alignment.Center) {
+                AndroidView(
+                    factory = { c -> PlayerView(c).apply { this.player = player; useController = false } },
+                    modifier = Modifier.fillMaxSize()
+                )
+                if (buffering) {
+                    CircularProgressIndicator(color = ColorCyan, modifier = Modifier.size(30.dp), strokeWidth = 3.dp)
+                }
+            }
+            if (playerErr != null) {
+                Spacer(Modifier.height(4.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Text(playerErr.orEmpty(), color = ColorCrimson, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onReloadStream) { Text("Reload", color = ColorCyan, fontSize = 11.sp) }
+                }
+            }
             Spacer(Modifier.height(4.dp))
             val frac = (((currentSec - startSec) / (endSec - startSec).coerceAtLeast(0.5)).toFloat()).coerceIn(0f, 1f)
             LinearProgressIndicator(progress = { frac }, color = ElectricIndigo, trackColor = MatteSlate, modifier = Modifier.fillMaxWidth())
@@ -2782,7 +2957,13 @@ fun LiveClipPreviewPlayer(
                     IconButton(onClick = { player.seekTo((startSec * 1000.0).toLong()); player.play() }) {
                         Icon(Icons.Rounded.Refresh, "Replay", tint = TextSecondary)
                     }
-                    Text(if (isOnlineStream) "LIVE PREVIEW" else "LOCAL PREVIEW", color = ColorCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    if (isOnlineStream) {
+                        TextButton(onClick = onReloadStream, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)) {
+                            Text("Reload", color = ColorCyan, fontSize = 10.sp)
+                        }
+                    } else {
+                        Text("LOCAL PREVIEW", color = ColorCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
                 Text("${TimeFormatter.formatTimestamp(currentSec.coerceIn(startSec, endSec))} / ${TimeFormatter.formatTimestamp(endSec)}", color = TextSecondary, fontSize = 11.sp)
             }
@@ -2812,7 +2993,7 @@ fun ClipCard(
     clip: ClipCandidate, totalDurationSec: Double, isExpanded: Boolean, isFocused: Boolean,
     localVideoPath: String?, resolvedStreamInfo: PlayableStreamInfo?, isResolvingPreview: Boolean, previewError: String?,
     onToggleSelect: () -> Unit, onToggleExpand: () -> Unit, onNudgeStart: (Double) -> Unit, onNudgeEnd: (Double) -> Unit,
-    onRangeDragged: (Double, Double) -> Unit
+    onRangeDragged: (Double, Double) -> Unit, onReloadStream: () -> Unit
 ) {
     val clipboard = LocalClipboardManager.current
     var copiedSocial by remember { mutableStateOf(false) }
@@ -2865,22 +3046,31 @@ fun ClipCard(
 
                     when {
                         !localVideoPath.isNullOrBlank() -> {
-                            LiveClipPreviewPlayer(Uri.fromFile(File(localVideoPath)), clip.startSec, clip.endSec, totalDurationSec, isOnlineStream = false, onRangeDragged = onRangeDragged)
+                            LiveClipPreviewPlayer(
+                                Uri.fromFile(File(localVideoPath)), StreamPreviewResolver.DESKTOP_UA, emptyMap(),
+                                clip.startSec, clip.endSec, totalDurationSec, false, onRangeDragged, onReloadStream
+                            )
                         }
                         resolvedStreamInfo != null -> {
-                            LiveClipPreviewPlayer(Uri.parse(resolvedStreamInfo.url), clip.startSec, clip.endSec, totalDurationSec, isOnlineStream = true, onRangeDragged = onRangeDragged)
+                            LiveClipPreviewPlayer(
+                                Uri.parse(resolvedStreamInfo.url), resolvedStreamInfo.userAgent, resolvedStreamInfo.headers,
+                                clip.startSec, clip.endSec, totalDurationSec, true, onRangeDragged, onReloadStream
+                            )
                         }
                         isResolvingPreview -> {
                             Surface(modifier = Modifier.fillMaxWidth(), color = ElevatedSlate, shape = RoundedCornerShape(12.dp)) {
                                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                                     CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = ColorCyan)
                                     Spacer(Modifier.width(10.dp))
-                                    Text("Loading authenticated stream preview...", color = ColorCyan, fontSize = 12.sp)
+                                    Text("Loading fast stream preview...", color = ColorCyan, fontSize = 12.sp)
                                 }
                             }
                         }
                         previewError != null -> {
-                            Text("Preview note: $previewError", color = TextMuted, fontSize = 11.sp)
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Text("Preview: $previewError", color = TextMuted, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                                TextButton(onClick = onReloadStream) { Text("Retry", color = ColorCyan, fontSize = 11.sp) }
+                            }
                         }
                     }
 
@@ -3121,6 +3311,7 @@ fun ClipPulseStudioScreen(viewModel: ClipPulseViewModel) {
                         val (pillTxt, pillCol) = when {
                             state.aiConfig.offlineNoAiMode -> "Offline Mode" to TextSecondary
                             state.aiConnectionState is AiConnectionState.Connected -> "\u2713 ${(state.aiConnectionState as AiConnectionState.Connected).latencyMs}ms" to ColorEmerald
+                            state.aiConnectionState is AiConnectionState.Testing -> "Connecting..." to ColorCyan
                             state.aiConnectionState is AiConnectionState.Error -> "AI Error" to ColorCrimson
                             state.aiConfig.primaryKey.isNotBlank() -> state.aiConfig.preset.displayName to ElectricIndigoLight
                             else -> "Setup AI" to ColorGold
@@ -3304,7 +3495,8 @@ fun ClipPulseStudioScreen(viewModel: ClipPulseViewModel) {
                             isResolvingPreview = state.isResolvingPreview, previewError = state.previewError,
                             onToggleSelect = { viewModel.toggleClipSelected(clip.id) }, onToggleExpand = { viewModel.toggleClipExpanded(clip.id) },
                             onNudgeStart = { viewModel.nudgeClipStart(clip.id, it) }, onNudgeEnd = { viewModel.nudgeClipEnd(clip.id, it) },
-                            onRangeDragged = { s, e -> viewModel.updateClipRange(clip.id, s, e) }
+                            onRangeDragged = { s, e -> viewModel.updateClipRange(clip.id, s, e) },
+                            onReloadStream = viewModel::reloadPreviewStream
                         )
                     }
                 }
@@ -3394,7 +3586,7 @@ private fun DownloadsControlCenter(
                             }
                         }
                         ExportJobState.Idle -> {
-                            Text("No active downloads. Select clips in Clip Studio and tap Export to queue section downloads.", color = TextMuted, fontSize = 12.sp)
+                            Text("No active downloads. Select clips in Clip Studio and tap Export to queue Turbo section downloads.", color = TextMuted, fontSize = 12.sp)
                         }
                     }
                 }
@@ -3459,7 +3651,7 @@ private fun DownloadsControlCenter(
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text("Broadcast Audio Leveling (loudnorm)", color = TextPrimary, fontSize = 13.sp)
-                            Text("Normalizes volume to -16 LUFS for Shorts & Reels", color = TextMuted, fontSize = 11.sp)
+                            Text("Turn off for instant Fast Cut speed; turn on for -16 LUFS leveling", color = TextMuted, fontSize = 11.sp)
                         }
                         Switch(checked = settings.loudnormEnabled, onCheckedChange = { onToggleLoudnorm() })
                     }
@@ -3518,9 +3710,10 @@ def main() -> None:
     write_core_kotlin()
     write_network_and_engines()
     write_exporter_service_and_ui()
-    print("\nClipPulse v2.2.0 Android project generated successfully!")
+    print("\nClipPulse v2.3.0 Android project generated successfully!")
 
 
 if __name__ == "__main__":
     main()
     sys.exit(0)
+    
